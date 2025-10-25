@@ -1,29 +1,23 @@
-/*
- * ntfs-3g_apply.c
+/* 
+ * ntfs-3g_apply.c (modified)
  *
  * Apply a WIM image directly to an NTFS volume using libntfs-3g.  Restore as
  * much information as possible, including security data, file attributes, DOS
  * names, alternate data streams, and object IDs.
  *
- * Note: because NTFS-3G offers inode-based interfaces, we actually don't need
- * to deal with paths at all!  (Other than for error messages.)
- */
-
-/*
+ * Enhancements in this fork:
+ * - Environment-driven handling of reparse write failures from libntfs-3g:
+ *     WIMLIB_NTFS3G_REPARSE_MODE = "fail" (default) | "skip" | "skip_save"
+ *     - fail      : original behavior; abort on error
+ *     - skip      : log a warning and continue
+ *     - skip_save : additionally store the raw reparse blob into a named
+ *                  alternate data stream ":wimlib.reparse.bin" on the same file
+ *                  so it can be restored later on Windows; continue on error
+ *
  * Copyright (C) 2012-2017 Eric Biggers
+ * Modifications (C) 2025 requested by user (robust error handling)
  *
- * This file is free software; you can redistribute it and/or modify it under
- * the terms of the GNU Lesser General Public License as published by the Free
- * Software Foundation; either version 3 of the License, or (at your option) any
- * later version.
- *
- * This file is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
- * FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
- * details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this file; if not, see https://www.gnu.org/licenses/.
+ * License: LGPL-3.0-or-later
  */
 
 #ifdef HAVE_CONFIG_H
@@ -33,6 +27,8 @@
 #include <errno.h>
 #include <locale.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 #include <ntfs-3g/attrib.h>
 #include <ntfs-3g/object_id.h>
@@ -50,6 +46,31 @@
 #include "wimlib/object_id.h"
 #include "wimlib/reparse.h"
 #include "wimlib/security.h"
+
+/* ---------------- New reparse handling mode ---------------- */
+enum reparse_mode_e {
+	REPARSE_MODE_FAIL = 0,
+	REPARSE_MODE_SKIP = 1,
+	REPARSE_MODE_SKIP_SAVE = 2,
+};
+
+static enum reparse_mode_e
+parse_reparse_mode_from_env(void)
+{
+	const char *s = getenv("WIMLIB_NTFS3G_REPARSE_MODE");
+	if (!s || !*s)
+		return REPARSE_MODE_FAIL;
+	/* case-insensitive compare */
+	char buf[32]; size_t i = 0;
+	for (; s[i] && i < sizeof(buf)-1; ++i) buf[i] = (char)tolower((unsigned char)s[i]);
+	buf[i] = 0;
+	if (!strcmp(buf, "skip_save") || !strcmp(buf, "save") || !strcmp(buf, "skip+save"))
+		return REPARSE_MODE_SKIP_SAVE;
+	if (!strcmp(buf, "skip"))
+		return REPARSE_MODE_SKIP;
+	return REPARSE_MODE_FAIL;
+}
+/* ----------------------------------------------------------- */
 
 static int
 ntfs_3g_get_supported_features(const char *target,
@@ -98,7 +119,83 @@ struct ntfs_3g_apply_ctx {
 	unsigned num_reparse_inodes;
 	ntfs_inode *ntfs_reparse_inodes[MAX_OPEN_FILES];
 	struct wim_inode *wim_reparse_inodes[MAX_OPEN_FILES];
+
+	/* ---------------- New: runtime behavior for reparse errors -------- */
+	enum reparse_mode_e reparse_mode;
 };
+
+/* Forward declarations for functions from original file (kept same) */
+static int ntfs_3g_set_timestamps(ntfs_inode *ni, const struct wim_inode *inode);
+static int ntfs_3g_restore_timestamps(ntfs_volume *vol, const struct wim_inode *inode);
+static int ntfs_3g_restore_dos_name(ntfs_inode *ni, ntfs_inode *dir_ni, struct wim_dentry *dentry, ntfs_volume *vol);
+static int ntfs_3g_restore_reparse_point(ntfs_inode *ni, const struct wim_inode *inode, unsigned blob_size, struct ntfs_3g_apply_ctx *ctx);
+static bool ntfs_3g_has_empty_attributes(const struct wim_inode *inode);
+static int ntfs_3g_create_empty_attributes(ntfs_inode *ni, const struct wim_inode *inode, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_set_metadata(ntfs_inode *ni, const struct wim_inode *inode, const struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_create_dirs_recursive(ntfs_inode *dir_ni, struct wim_dentry *dir, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_create_directories(struct wim_dentry *root, struct list_head *dentry_list, struct ntfs_3g_apply_ctx *ctx);
+static struct wim_dentry * ntfs_3g_first_extraction_alias(struct wim_inode *inode);
+static int ntfs_3g_add_link(ntfs_inode *ni, struct wim_dentry *dentry);
+static int ntfs_3g_create_nondirectory(struct wim_inode *inode, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_create_nondirectories(struct list_head *dentry_list, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_begin_extract_blob_instance(struct blob_descriptor *blob, ntfs_inode *ni, struct wim_inode *inode, const struct wim_inode_stream *strm, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_cleanup_blob_extract(struct ntfs_3g_apply_ctx *ctx);
+static ntfs_inode * ntfs_3g_open_inode(struct wim_inode *inode, struct ntfs_3g_apply_ctx *ctx);
+static int ntfs_3g_begin_extract_blob(struct blob_descriptor *blob, void *_ctx);
+static bool ntfs_3g_full_pwrite(ntfs_attr *na, u64 offset, size_t size, const u8 *data);
+static int ntfs_3g_extract_chunk(const struct blob_descriptor *blob, u64 offset, const void *chunk, size_t size, void *_ctx);
+static int ntfs_3g_end_extract_blob(struct blob_descriptor *blob, int status, void *_ctx);
+static u64 ntfs_3g_count_dentries(const struct list_head *dentry_list);
+static int ntfs_3g_extract(struct list_head *dentry_list, struct apply_ctx *_ctx);
+
+/* ---------------- Helper: build UTF-16LE ntfschar name from ASCII ---------- */
+static void ascii_to_ntfschar(const char *ascii, ntfschar *dst, u32 *out_len)
+{
+	u32 i = 0;
+	for (; ascii[i] && i < 255; i++) {
+		dst[i] = cpu_to_le16((unsigned char)ascii[i]);
+	}
+	dst[i] = cpu_to_le16(0);
+	if (out_len) *out_len = i;
+}
+
+/* ---------------- Helper: save reparse blob into ADS on same file ---------- */
+static void ntfs_3g_try_save_reparse_ads(ntfs_inode *ni,
+                                         const struct ntfs_3g_apply_ctx *ctx,
+                                         const struct wim_inode *inode,
+                                         unsigned blob_size)
+{
+	/* Only attempt when requested */
+	if (ctx->reparse_mode != REPARSE_MODE_SKIP_SAVE)
+		return;
+
+	/* Prepare ADS name ":wimlib.reparse.bin" (name part only) */
+	ntfschar name16[64];
+	u32 name_len = 0;
+	ascii_to_ntfschar("wimlib.reparse.bin", name16, &name_len);
+
+	/* Ensure named stream exists, then write */
+	if (ntfs_attr_add(ni, AT_DATA, name16, name_len, NULL, 0)) {
+		/* It may already exist; that's fine, continue to open. */
+	}
+
+	ntfs_attr *ads = ntfs_attr_open(ni, AT_DATA, name16, name_len);
+	if (!ads) {
+		WARNING("Could not open ADS :wimlib.reparse.bin for \"%s\"; continuing.",
+		        dentry_full_path(inode_first_extraction_dentry(inode)));
+		return;
+	}
+
+	const size_t bytes = REPARSE_DATA_OFFSET + blob_size;
+	ssize_t wr = ntfs_attr_pwrite(ads, 0, bytes, (const char *)&ctx->rpbuf);
+	if (wr < (ssize_t)bytes) {
+		WARNING("Could not fully save reparse blob ADS for \"%s\"; wrote %lld/%zu bytes.",
+		        dentry_full_path(inode_first_extraction_dentry(inode)),
+		        (long long)wr, bytes);
+	}
+	ntfs_attr_close(ads);
+}
+/* -------------------------------------------------------------------------- */
 
 static int
 ntfs_3g_set_timestamps(ntfs_inode *ni, const struct wim_inode *inode)
@@ -235,6 +332,20 @@ ntfs_3g_restore_reparse_point(ntfs_inode *ni, const struct wim_inode *inode,
 				"points.  This bug was fixed in NTFS-3G version "
 				"2016.2.22.");
 		}
+
+		/* New behavior: optionally skip (and optionally save ADS) */
+		if (ctx->reparse_mode == REPARSE_MODE_SKIP ||
+		    ctx->reparse_mode == REPARSE_MODE_SKIP_SAVE) {
+			if (ctx->reparse_mode == REPARSE_MODE_SKIP_SAVE) {
+				/* Best effort save of raw reparse bytes */
+				ntfs_3g_try_save_reparse_ads(ni, ctx, inode, blob_size);
+			}
+			WARNING("Skipping reparse data for \"%s\" (errno=%d). "
+			        "Set WIMLIB_NTFS3G_REPARSE_MODE=fail to enforce strict behavior.",
+			        dentry_full_path(inode_first_extraction_dentry(inode)), err);
+			return 0; /* treat as non-fatal */
+		}
+
 		return WIMLIB_ERR_SET_REPARSE_DATA;
 	}
 
@@ -963,6 +1074,9 @@ ntfs_3g_extract(struct list_head *dentry_list, struct apply_ctx *_ctx)
 	ntfs_volume *vol;
 	struct wim_dentry *root;
 	int ret;
+
+	/* Initialize runtime behavior for reparse errors */
+	ctx->reparse_mode = parse_reparse_mode_from_env();
 
 	/* For NTFS-3G extraction mode we require that the dentries to extract
 	 * form a single tree.  */
