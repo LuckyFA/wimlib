@@ -340,8 +340,7 @@ ntfs_3g_restore_reparse_point(ntfs_inode *ni, const struct wim_inode *inode,
 				/* Best effort save of raw reparse bytes */
 				ntfs_3g_try_save_reparse_ads(ni, ctx, inode, blob_size);
 			}
-			WARNING("Skipping reparse data for \"%s\" (errno=%d). "
-			        "Set WIMLIB_NTFS3G_REPARSE_MODE=fail to enforce strict behavior.",
+			WARNING("Skipping reparse data for \"%s\" (errno=%d). ",
 			        dentry_full_path(inode_first_extraction_dentry(inode)), err);
 			return 0; /* treat as non-fatal */
 		}
